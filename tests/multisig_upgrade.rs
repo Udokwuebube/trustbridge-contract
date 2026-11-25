@@ -353,6 +353,47 @@ fn test_execute_fails_with_no_live_proposal() {
 }
 
 #[test]
+fn test_execute_rejects_staged_hash_mismatch_without_partial_state() {
+    let (env, admin, upgrader, _random, contract_id) = setup();
+    env.ledger().set_timestamp(1_000);
+    let staged_hash = hash(&env, 0xA1);
+    let proposal_hash = hash(&env, 0xB2);
+
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::stage_wasm(env.clone(), admin.clone(), staged_hash.clone()).unwrap();
+        TrustBridgeContract::propose_multisig_upgrade(
+            env.clone(),
+            admin.clone(),
+            proposal_hash.clone(),
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            TrustBridgeContract::execute_upgrade(env.clone(), upgrader.clone(), 0),
+            Err(ContractError::StagedWasmMismatch)
+        );
+
+        let proposal = TrustBridgeContract::get_upgrade_proposal(env.clone())
+            .expect("mismatched execution must leave the proposal pending");
+        assert_eq!(proposal.id, 0);
+        assert_eq!(proposal.wasm_hash, proposal_hash);
+
+        let staged = TrustBridgeContract::get_staged(env.clone())
+            .expect("mismatched execution must preserve the staged hash");
+        assert_eq!(staged.wasm_hash, staged_hash);
+        assert_eq!(staged.staged_by, admin);
+        assert_eq!(staged.staged_at, 1_000);
+
+        assert!(
+            TrustBridgeContract::get_provenance(env.clone()).is_none(),
+            "mismatched execution must not write upgrade provenance"
+        );
+    });
+}
+
+#[test]
 fn test_random_cannot_execute_even_when_conditions_are_met() {
     let (env, admin, _upgrader, random, contract_id) = setup();
     env.ledger().set_timestamp(1_000);
@@ -396,6 +437,7 @@ fn test_successful_execute_after_threshold_and_delay() {
     env.mock_all_auths();
     env.as_contract(&contract_id, || {
         TrustBridgeContract::set_upgrade_threshold(env.clone(), admin.clone(), 2).unwrap();
+        TrustBridgeContract::stage_wasm(env.clone(), admin.clone(), new_wasm_hash.clone()).unwrap();
         TrustBridgeContract::propose_multisig_upgrade(
             env.clone(),
             admin.clone(),
@@ -431,6 +473,10 @@ fn test_successful_execute_after_threshold_and_delay() {
         assert!(
             TrustBridgeContract::get_upgrade_proposal(env.clone()).is_none(),
             "executed proposal must be cleared"
+        );
+        assert!(
+            TrustBridgeContract::get_staged(env.clone()).is_none(),
+            "successful execution must clear the matching staged hash"
         );
         // Provenance records the swap exactly like the single-admin path.
         let prov = TrustBridgeContract::get_provenance(env.clone())

@@ -647,7 +647,10 @@ Gotchas:
   contract WASM; a bad `--wasm-hash` bricks the contract until another
   governance round can replace it.
 - If a staged WASM slot is set (`stage_wasm` / `get_staged`), the proposal hash
-  must match it or `execute_upgrade` fails with `StagedWasmMismatch`.
+  must match it or `execute_upgrade` fails with `StagedWasmMismatch`. The
+  rejected execution does not apply WASM or write upgrade provenance; the
+  proposal and staged hash remain available so operators can cancel the
+  proposal or correct the staged hash before retrying.
 - `clear_staged` is **idempotent**. Admin-only. If nothing is staged (retry
   after an aborted upgrade, a second clear, or after `execute_upgrade` already
   emptied the slot), the call returns `Ok(())`, leaves no `stgwasm` instance
