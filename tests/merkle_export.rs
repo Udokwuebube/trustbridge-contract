@@ -33,6 +33,38 @@ fn setup() -> (Env, Address, Address) {
     (env, admin, contract_id)
 }
 
+fn collect_public_export(
+    env: &Env,
+    contract_id: &Address,
+    limit: u32,
+) -> (SVec<(String, ContributorRecord)>, SVec<BytesN<32>>) {
+    let mut records = SVec::new(env);
+    let mut page_roots = SVec::new(env);
+    let mut cursor = None;
+    loop {
+        let page = env.as_contract(contract_id, || {
+            TrustBridgeContract::get_public_paginated(env.clone(), cursor.clone(), limit).unwrap()
+        });
+        assert_eq!(
+            page.merkle_root,
+            independent_root_of_records(env, &page.records),
+            "each exported page root must match its returned records"
+        );
+        page_roots.push_back(page.merkle_root.clone());
+        for i in 0..page.records.len() {
+            records.push_back(page.records.get(i).unwrap());
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => {
+                assert!(!page.has_more);
+                break;
+            }
+        }
+    }
+    (records, page_roots)
+}
+
 fn s(env: &Env, text: &str) -> String {
     String::from_str(env, text)
 }
@@ -901,6 +933,191 @@ fn test_record_removal_invalidates_prior_merkle_roots() {
     assert_eq!(
         independent_root_of_records(&env, &walk_recs),
         after_page.merkle_root
+    );
+}
+
+#[test]
+fn test_merkle_exports_preserve_live_order_across_empty_chunk_and_compaction() {
+    let (env, admin, contract_id) = setup();
+    let total = 110u32;
+
+    env.mock_all_auths();
+    for i in 0..total {
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::register(
+                env.clone(),
+                s(&env, &format!("user{i:03}")),
+                Address::generate(&env),
+                SVec::new(&env),
+            )
+            .unwrap();
+        });
+    }
+
+    let (baseline, _) = collect_public_export(&env, &contract_id, 7);
+    let baseline_root = independent_root_of_records(&env, &baseline);
+    assert_eq!(baseline.len(), total);
+
+    env.mock_all_auths();
+    for i in 50..100 {
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::remove(
+                env.clone(),
+                admin.clone(),
+                s(&env, &format!("user{i:03}")),
+            )
+            .unwrap();
+        });
+    }
+
+    let (after_removal, after_removal_page_roots) = collect_public_export(&env, &contract_id, 7);
+    let after_removal_root = independent_root_of_records(&env, &after_removal);
+    assert_eq!(after_removal.len(), 60);
+    assert_ne!(
+        after_removal_root, baseline_root,
+        "removing a chunk of records must change the full live-registry root"
+    );
+    for i in 0..50 {
+        assert_eq!(
+            after_removal.get(i).unwrap().0,
+            s(&env, &format!("user{i:03}"))
+        );
+    }
+    for i in 50..60 {
+        assert_eq!(
+            after_removal.get(i).unwrap().0,
+            s(&env, &format!("user{:03}", i + 50))
+        );
+    }
+
+    let (after_removal_single_page, after_removal_single_page_roots) =
+        collect_public_export(&env, &contract_id, 100);
+    assert_eq!(
+        independent_root_of_records(&env, &after_removal_single_page),
+        after_removal_root,
+        "pagination limits must not change the root of the same live record set"
+    );
+    assert_eq!(after_removal_single_page_roots.len(), 1);
+    assert_eq!(
+        after_removal_single_page_roots.get(0),
+        Some(after_removal_root.clone())
+    );
+
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::compact_index(env.clone()).unwrap();
+    });
+    let (after_compaction, after_compaction_page_roots) =
+        collect_public_export(&env, &contract_id, 7);
+    assert_eq!(after_compaction.len(), after_removal.len());
+    assert_eq!(
+        independent_root_of_records(&env, &after_compaction),
+        after_removal_root,
+        "compacting index holes must preserve the exported order and Merkle root"
+    );
+    assert_eq!(
+        after_compaction_page_roots.len(),
+        after_removal_page_roots.len()
+    );
+    for i in 0..after_compaction_page_roots.len() {
+        assert_eq!(
+            after_compaction_page_roots.get(i),
+            after_removal_page_roots.get(i),
+            "compaction must preserve each page root when the record set and limit are unchanged"
+        );
+    }
+}
+
+#[test]
+fn test_cursor_issued_before_removal_fails_after_registry_hole() {
+    let (env, admin, contract_id) = setup();
+    let names = ["alice", "bob", "carol"];
+    let addrs: Vec<Address> = names.iter().map(|_| Address::generate(&env)).collect();
+
+    env.mock_all_auths();
+    for (name, addr) in names.iter().zip(addrs.iter()) {
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::register(
+                env.clone(),
+                s(&env, name),
+                addr.clone(),
+                SVec::new(&env),
+            )
+            .unwrap();
+        });
+    }
+    let first_page = env.as_contract(&contract_id, || {
+        TrustBridgeContract::get_public_paginated(env.clone(), None, 1).unwrap()
+    });
+    let stale_cursor = first_page
+        .next_cursor
+        .expect("first page must have a next cursor");
+
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::remove(env.clone(), admin.clone(), s(&env, "alice")).unwrap();
+    });
+    assert_eq!(
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::get_public_paginated(env.clone(), Some(stale_cursor), 1)
+        }),
+        Err(ContractError::InvalidCursor),
+        "a cursor from before removal must not resume into shifted export positions"
+    );
+}
+
+#[test]
+fn test_removed_record_proof_fails_against_post_removal_root() {
+    let (env, _admin, contract_id) = setup();
+    let names = ["alice", "bob", "carol", "dave"];
+    let addrs: Vec<Address> = names.iter().map(|_| Address::generate(&env)).collect();
+
+    env.mock_all_auths();
+    for (name, addr) in names.iter().zip(addrs.iter()) {
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::register(
+                env.clone(),
+                s(&env, name),
+                addr.clone(),
+                SVec::new(&env),
+            )
+            .unwrap();
+        });
+    }
+
+    let before_removal = env.as_contract(&contract_id, || {
+        TrustBridgeContract::get_public_paginated(env.clone(), None, 10).unwrap()
+    });
+    let mut leaves = SVec::new(&env);
+    for i in 0..before_removal.records.len() {
+        let (username, record) = before_removal.records.get(i).unwrap();
+        leaves.push_back(leaf_hash(
+            &env,
+            &username,
+            &record.stellar_address,
+            record.verified,
+        ));
+    }
+    let removed_leaf = leaves.get(1).unwrap();
+    let removed_proof = build_proof(&env, &leaves, 1);
+
+    env.as_contract(&contract_id, || {
+        TrustBridgeContract::remove(env.clone(), addrs[1].clone(), s(&env, "bob")).unwrap();
+    });
+    let after_removal = env.as_contract(&contract_id, || {
+        TrustBridgeContract::get_public_paginated(env.clone(), None, 10).unwrap()
+    });
+    assert_eq!(
+        after_removal.merkle_root,
+        independent_root_of_records(&env, &after_removal.records)
+    );
+    assert!(
+        !verify_proof(
+            &env,
+            &removed_leaf,
+            &removed_proof,
+            &after_removal.merkle_root
+        ),
+        "a pre-removal proof for a deleted record must not verify against the new root"
     );
 }
 

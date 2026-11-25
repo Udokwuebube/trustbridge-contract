@@ -65,6 +65,11 @@ fn assert_index_membership_property(env: &Env, contract_id: &Address) {
                 .get(&(symbol_short!("chunk"), c))
                 .unwrap_or_else(|| Vec::new(env));
             for u in chunk.iter() {
+                assert!(
+                    !chunked.contains(u.clone()),
+                    "username {:?} appears more than once in the chunked index",
+                    u
+                );
                 chunked.push_back(u);
             }
         }
@@ -75,11 +80,24 @@ fn assert_index_membership_property(env: &Env, contract_id: &Address) {
             "flat index and the union of all chunks must have the same length"
         );
 
-        for username in index.iter() {
+        let mut flat_seen: Vec<String> = Vec::new(env);
+        for i in 0..index.len() {
+            let username = index.get(i).unwrap();
+            assert!(
+                !flat_seen.contains(username.clone()),
+                "username {:?} appears more than once in the flat index",
+                username
+            );
+            flat_seen.push_back(username.clone());
             assert!(
                 TrustBridgeContract::has_record(env.clone(), username.clone()),
                 "flat index contains {:?} but it has no backing record",
                 username
+            );
+            assert_eq!(
+                chunked.get(i),
+                Some(username.clone()),
+                "flat and chunked indexes must preserve the same registry order"
             );
             assert!(
                 chunked.contains(username.clone()),
@@ -101,6 +119,24 @@ fn assert_index_membership_property(env: &Env, contract_id: &Address) {
             );
         }
     });
+}
+
+fn export_public_names(env: &Env, contract_id: &Address, limit: u32) -> Vec<String> {
+    let mut names = Vec::new(env);
+    let mut cursor = None;
+    loop {
+        let page = env.as_contract(contract_id, || {
+            TrustBridgeContract::get_public_paginated(env.clone(), cursor.clone(), limit).unwrap()
+        });
+        for i in 0..page.records.len() {
+            names.push_back(page.records.get(i).unwrap().0);
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    names
 }
 
 #[test]
@@ -184,16 +220,14 @@ fn test_index_membership_property_holds_across_register_remove_compact_sequence(
 }
 
 #[test]
-fn test_index_membership_property_holds_at_chunk_boundary() {
+fn test_export_skips_empty_middle_chunk_and_compaction_preserves_order() {
     let (env, admin, contract_id) = setup();
+    let total = 110u32;
 
-    // CHUNK_SIZE is 50 (docs/REGISTRY_INVARIANTS.md); register enough users
-    // to span two chunks, then remove across the boundary and compact.
-    let total = 60u32;
     env.mock_all_auths();
-    env.as_contract(&contract_id, || {
-        for i in 0..total {
-            let name = format!("user{i}");
+    for i in 0..total {
+        let name = format!("user{i:03}");
+        env.as_contract(&contract_id, || {
             TrustBridgeContract::register(
                 env.clone(),
                 s(&env, &name),
@@ -201,19 +235,89 @@ fn test_index_membership_property_holds_at_chunk_boundary() {
                 Vec::new(&env),
             )
             .unwrap();
-        }
+        });
+    }
+
+    for i in 50..100 {
+        let name = format!("user{i:03}");
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::remove(env.clone(), admin.clone(), s(&env, &name)).unwrap();
+        });
+    }
+
+    assert_index_membership_property(&env, &contract_id);
+    env.as_contract(&contract_id, || {
+        let chunk_count: u32 = env
+            .storage()
+            .instance()
+            .get(&symbol_short!("chkcnt"))
+            .unwrap_or(0);
+        let middle_chunk: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&(symbol_short!("chunk"), 1u32))
+            .unwrap_or_else(|| Vec::new(&env));
+        assert_eq!(chunk_count, 3);
+        assert!(middle_chunk.is_empty());
     });
+
+    let before_compaction = export_public_names(&env, &contract_id, 7);
+    assert_eq!(before_compaction.len(), 60);
+    for i in 0..50 {
+        assert_eq!(
+            before_compaction.get(i),
+            Some(s(&env, &format!("user{i:03}")))
+        );
+    }
+    for i in 50..60 {
+        assert_eq!(
+            before_compaction.get(i),
+            Some(s(&env, &format!("user{:03}", i + 50)))
+        );
+    }
+
+    env.mock_all_auths();
+    env.as_contract(&contract_id, || {
+        assert_eq!(TrustBridgeContract::compact_index(env.clone()).unwrap(), 2);
+    });
+    assert_index_membership_property(&env, &contract_id);
+    assert_eq!(
+        export_public_names(&env, &contract_id, 7),
+        before_compaction
+    );
+}
+
+#[test]
+fn test_index_membership_property_holds_at_chunk_boundary() {
+    let (env, admin, contract_id) = setup();
+
+    // CHUNK_SIZE is 50 (docs/REGISTRY_INVARIANTS.md); register enough users
+    // to span two chunks, then remove across the boundary and compact.
+    let total = 60u32;
+    env.mock_all_auths();
+    for i in 0..total {
+        let name = format!("user{i}");
+        env.as_contract(&contract_id, || {
+            TrustBridgeContract::register(
+                env.clone(),
+                s(&env, &name),
+                Address::generate(&env),
+                Vec::new(&env),
+            )
+            .unwrap();
+        });
+    }
     assert_index_membership_property(&env, &contract_id);
 
     // Remove a run of usernames straddling the chunk boundary (indices
     // 45..=54), then compact.
     env.mock_all_auths();
-    env.as_contract(&contract_id, || {
-        for i in 45..55 {
-            let name = format!("user{i}");
+    for i in 45..55 {
+        let name = format!("user{i}");
+        env.as_contract(&contract_id, || {
             TrustBridgeContract::remove(env.clone(), admin.clone(), s(&env, &name)).unwrap();
-        }
-    });
+        });
+    }
     assert_index_membership_property(&env, &contract_id);
 
     env.mock_all_auths();
