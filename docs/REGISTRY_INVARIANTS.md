@@ -1,9 +1,9 @@
 # Registry Invariants
 
 These invariants help reviewers reason about safe contract changes. The
-invariants below are enforced by the property fuzzing suite in `src/lib.rs` or
-the opt-in scale harness, so a change that breaks one is caught before reaching
-testnet.
+invariants below are enforced by integration tests, the property fuzzing suite
+in `src/lib.rs`, or the opt-in scale harness, so a change that breaks one is
+caught before reaching testnet.
 
 Related docs: [ABI](ABI.md) · [ARCHITECTURE](ARCHITECTURE.md) · [SECURITY](SECURITY.md)
 
@@ -40,6 +40,28 @@ Related docs: [ABI](ABI.md) · [ARCHITECTURE](ARCHITECTURE.md) · [SECURITY](SEC
 | I11 | After mixed `batch_verify` / `batch_remove` calls (duplicates, unregistered names), `get_stats().total` equals the enumerable index length and `verified` equals live verified records | `tests/counter_proofs.rs::proof_counters_match_index_under_mixed_batches` |
 | I12 | A rejected batch (`InvalidBatchSize`) moves no counter and leaves the index untouched | `tests/counter_proofs.rs::proof_rejected_batch_moves_no_counter` |
 | I13 | A pagination cursor decodes only against the `INDEX_GEN` it was issued under; a cursor from any other generation (older, newer, or across the `u32::MAX` wrap) returns `InvalidCursor` on both `get_public_paginated` and `get_registered_paginated` | `test_public_paginated_rejects_cursor_from_any_other_generation`, `test_generation_wraps_at_u32_max_and_still_invalidates_cursors` |
+| I14 | After removal leaves empty or partial chunks, exports contain each live record exactly once in registry order; compaction preserves that order and the Merkle root for an unchanged record set | `tests/registry_hole_policy.rs::test_export_skips_empty_middle_chunk_and_compaction_preserves_order`, `tests/merkle_export.rs::test_merkle_exports_preserve_live_order_across_empty_chunk_and_compaction` |
+
+### Hole policy (Issue #761)
+
+Removing a username updates the flat index and removes it from its existing
+chunk. Other chunks are not shifted to fill the resulting capacity, so an
+empty interior chunk or a partially filled chunk is valid until the admin runs
+`compact_index`. These are storage-capacity holes, not export positions:
+paginated exports traverse the existing usernames in chunk order and count
+only those live entries. The concatenated chunk order must exactly match the
+flat registry order, with every username represented once and backed by a
+record (I5 and I14).
+
+`compact_index` repacks the same registry order into full chunks plus an
+optional partial tail. It does not change the exported record set, its page
+boundaries by live-record offset, or the Merkle root computed from the same
+page records. Removal, by contrast, changes the live snapshot and bumps the
+index generation; clients must restart pagination from `cursor = None` after
+`InvalidCursor`. Merkle roots are snapshot commitments, not lifetime
+accumulators: recompute from the current returned records after a removal.
+Tests in `tests/merkle_export.rs` also verify that a proof for a removed record
+does not validate against the post-removal root.
 
 ### Cursors from other index generations (Issue #693)
 

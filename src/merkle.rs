@@ -78,6 +78,18 @@
 //! membership — a verifier needs the leaf's plaintext fields (username,
 //! address, verified flag) and a sibling-hash path, exactly like any
 //! standard Merkle proof.
+//!
+//! ## Registry removals and snapshot continuity
+//!
+//! An export root describes only the records returned for that page in the
+//! current registry snapshot; it is not a historical accumulator. Removing a
+//! record changes the live export and therefore requires a freshly computed
+//! root. Any cursor issued before a removal is rejected because the removal
+//! shifts export positions. The chunked index may retain empty or partially
+//! filled chunks until `compact_index` runs, but exports count only live
+//! entries in chunk order. Compaction preserves that order, so the root for
+//! the same exported records is unchanged by compaction alone. See
+//! `docs/REGISTRY_INVARIANTS.md#hole-policy`.
 
 use soroban_sdk::{Bytes, BytesN, Env, String, Vec};
 
